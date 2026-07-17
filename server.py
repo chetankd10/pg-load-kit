@@ -343,6 +343,9 @@ def gen_scripts(m, schema=None):
     it works on ANY table; otherwise it falls back to the simple queue-shape INSERT.
     Identifiers are quoted; no raw user text is interpolated unescaped."""
     os.makedirs(GEN, exist_ok=True)
+    # Trim stray whitespace on every string field — a trailing space in a value
+    # like "shipped " is a common paste error and would fail as an invalid enum.
+    m = {k: (v.strip() if isinstance(v, str) else v) for k, v in m.items()}
     jt   = qual(m["jobs_schema"], m["jobs_table"])
     id_  = qi(m["jobs_id"])
     st   = qi(m["jobs_status"])
@@ -694,6 +697,10 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
  .note.bad{background:#fef2f2;border-color:#f0a8a8;color:#7a1a1a}
  .mtable{margin:10px 0} .mtable h3{margin:0 0 4px;font-size:12px;color:var(--pp)}
  .mtable pre{max-height:220px;font-size:11px;margin:0}
+ .help{font-size:11px;color:#6b7280;margin:2px 0 6px;line-height:1.35}
+ .help code{background:#f0ecf7;padding:0 3px;border-radius:3px;font-size:10px}
+ fieldset .grid2 .help{margin-top:2px}
+ .steps{font-size:12px;color:#52525b;margin:6px 0 0;padding-left:18px} .steps li{margin:2px 0}
 </style></head><body>
 <header><h1>pg-load-kit — control panel</h1>
 <p>Local only (127.0.0.1). Runs <b>psql</b>/<b>pgbench</b> against the DATABASE_URL you provide.</p></header>
@@ -702,9 +709,15 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
    <h2>1 · Connection</h2>
    <label>DATABASE_URL</label>
    <input id="db" placeholder="postgres://user:pass@host:5432/dbname?sslmode=require" autocomplete="off">
-   <div class="muted">For <b>Check</b>/<b>Discover</b> you can use prod (read-only). For <b>Run load</b> use a FORK/CLONE only.</div>
+   <div class="help">Paste any Postgres connection string. Append <code>?sslmode=require</code> if it errors on SSL (common on Heroku). For <b>Check</b>/<b>Discover</b> you may use prod (read-only). For <b>Run load</b> use a <b>FORK/CLONE or DEV/UAT</b> only — never production.</div>
    <button class="ghost" onclick="discover()">🔍 Discover schema</button>
    <span id="dstat" class="muted"></span>
+   <ol class="steps">
+     <li><b>Discover schema</b> — reads this DB's tables/columns/keys and pre-fills a suggested mapping (section 2).</li>
+     <li><b>Confirm the mapping</b> — fix the dropdowns/values (each field is explained inline).</li>
+     <li><b>✓ Validate mapping</b> — confirms the SQL fits your schema; nothing is written.</li>
+     <li><b>Generate &amp; run load</b> — tick the FORK/CLONE box, then run &amp; read the results below.</li>
+   </ol>
  </div>
 
  <div class="card">
@@ -724,13 +737,22 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 
  <div class="card">
    <h2>Run settings</h2>
-   <div class="row"><div><label>Clients</label><input id="clients" type="number" value="20"></div>
-     <div><label>Threads</label><input id="threads" type="number" value="4"></div></div>
-   <div class="row"><div><label>Duration (s)</label><input id="duration" type="number" value="30"></div>
-     <div><label>Warmup (s)</label><input id="warmup" type="number" value="10"></div></div>
-   <div class="row"><div><label>W consumer</label><input id="w_consumer" type="number" value="6"></div>
-     <div><label>W producer</label><input id="w_producer" type="number" value="2"></div>
-     <div><label>W update</label><input id="w_update" type="number" value="5"></div></div>
+   <p class="help">How hard and how long to push. These control the load intensity, not the SQL.</p>
+   <div class="row"><div><label>Clients</label><input id="clients" type="number" value="20">
+       <div class="help">Simultaneous connections. More = more contention. Start ~20.</div></div>
+     <div><label>Threads</label><input id="threads" type="number" value="4">
+       <div class="help">pgbench worker threads. Rule of thumb: clients ÷ 5.</div></div></div>
+   <div class="row"><div><label>Duration (s)</label><input id="duration" type="number" value="30">
+       <div class="help">Measured run length. Use 300+ to let autovacuum/bloat show up.</div></div>
+     <div><label>Warmup (s)</label><input id="warmup" type="number" value="10">
+       <div class="help">Discarded warm-up before measuring (cold cache). ~10–60.</div></div></div>
+   <div class="row"><div><label>W consumer</label><input id="w_consumer" type="number" value="6">
+       <div class="help">Weight: queue-claim traffic.</div></div>
+     <div><label>W producer</label><input id="w_producer" type="number" value="2">
+       <div class="help">Weight: enqueue INSERTs. <code>0</code> to skip.</div></div>
+     <div><label>W update</label><input id="w_update" type="number" value="5">
+       <div class="help">Weight: big-table UPDATEs.</div></div></div>
+   <p class="help">Weights are <b>relative ratios</b> (6/2/5 ≈ 46% / 15% / 38%). Derive them from your real <code>pg_stat_statements</code> mix; set any to <code>0</code> to disable that pattern.</p>
    <label><input type="checkbox" id="matview" style="width:auto"> also refresh matview</label>
  </div>
 
@@ -738,35 +760,56 @@ PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
    <h2>2 · Schema mapping <span class="pill">auto-detected — confirm or override</span></h2>
    <div class="muted" id="maphint"></div>
    <fieldset><legend>Job-queue table (SKIP LOCKED churn)</legend>
+     <p class="help">Simulates workers claiming "to-do" rows and marking them done. Pick a table that has a <b>status/state column</b> (text or enum). If a table has no such column, it isn't a queue — use it as the big-update table below instead.</p>
      <div class="grid2">
-       <div><label>Table</label><select id="jobs_table" onchange="onJobsTable()"></select></div>
-       <div><label>ID / order column</label><select id="jobs_id"></select></div>
-       <div><label>Status column</label><select id="jobs_status"></select></div>
-       <div><label>Locked-at column</label><select id="jobs_locked_at"></select></div>
-       <div><label>Payload column</label><select id="jobs_payload"></select></div>
-       <div><label>Created-at column</label><select id="jobs_created_at"></select></div>
-       <div><label>"queued" value</label><input id="queued_value" value="queued"></div>
-       <div><label>"running" value</label><input id="running_value" value="running"></div>
+       <div><label>Table</label><select id="jobs_table" onchange="onJobsTable()"></select>
+         <div class="help">The table workers claim rows from (e.g. a jobs/orders/outbox table).</div></div>
+       <div><label>ID / order column</label><select id="jobs_id"></select>
+         <div class="help">Primary key used to order &amp; lock rows. Usually the <code>id</code> column.</div></div>
+       <div><label>Status column</label><select id="jobs_status"></select>
+         <div class="help"><b>Must be text/enum</b> (not an integer). Holds the workflow state, e.g. <code>status</code>.</div></div>
+       <div><label>Locked-at column</label><select id="jobs_locked_at"></select>
+         <div class="help">A timestamp column stamped when a row is claimed. Any spare timestamp works.</div></div>
+       <div><label>Payload column</label><select id="jobs_payload"></select>
+         <div class="help">A text column written by the producer INSERT. Not critical — any text column.</div></div>
+       <div><label>Created-at column</label><select id="jobs_created_at"></select>
+         <div class="help">Timestamp set on insert. Usually <code>created</code>/<code>created_at</code>.</div></div>
+       <div><label>"queued" value</label><input id="queued_value" value="queued">
+         <div class="help">A <b>real value already in the status column</b> meaning "waiting" (e.g. <code>pending</code>). No trailing spaces.</div></div>
+       <div><label>"running" value</label><input id="running_value" value="running">
+         <div class="help">A <b>real value</b> meaning "claimed/in-progress" (e.g. <code>shipped</code>). Must differ from the queued value.</div></div>
      </div>
    </fieldset>
    <fieldset><legend>Big UPDATE-target table (integration-sync volume)</legend>
+     <p class="help">Simulates a sync process constantly UPDATEing rows in a large table. Pick your <b>biggest, most-written table</b> — this drives write volume, dead-row bloat, and autovacuum pressure.</p>
      <div class="grid2">
-       <div><label>Table</label><select id="big_table" onchange="onBigTable()"></select></div>
-       <div><label>PK column</label><select id="big_pk"></select></div>
-       <div><label>Payload column</label><select id="big_payload"></select></div>
-       <div><label>Updated-at column</label><select id="big_updated_at"></select></div>
-       <div><label>Max PK (zipfian range)</label><input id="big_max_pk" type="number" value="100000"></div>
-       <div><label>Zipfian skew s (&gt;1 = hotter)</label><input id="zipfian_s" value="1.1"></div>
+       <div><label>Table</label><select id="big_table" onchange="onBigTable()"></select>
+         <div class="help">The large table to hammer with UPDATEs (usually the biggest by row count).</div></div>
+       <div><label>PK column</label><select id="big_pk"></select>
+         <div class="help">Primary key targeted by each UPDATE. Usually <code>id</code>.</div></div>
+       <div><label>Payload column</label><select id="big_payload"></select>
+         <div class="help">Optional column to "touch" on each UPDATE. Pick <code>(none)</code> if unsure.</div></div>
+       <div><label>Updated-at column</label><select id="big_updated_at"></select>
+         <div class="help">Optional timestamp set to <code>now()</code> on each UPDATE. <code>(none)</code> is fine.</div></div>
+       <div><label>Max PK (zipfian range)</label><input id="big_max_pk" type="number" value="100000">
+         <div class="help">The table's <b>max(pk)</b> — so random ids hit existing rows. Set to the real row count.</div></div>
+       <div><label>Zipfian skew s (&gt;1 = hotter)</label><input id="zipfian_s" value="1.1">
+         <div class="help">How concentrated the writes are. <code>1.1</code>=mild hotspot; higher=hotter few rows. Leave at 1.1.</div></div>
      </div>
    </fieldset>
    <fieldset><legend>Materialized view (optional)</legend>
-     <div><label>Matview (schema.name)</label><select id="matview_sel"></select></div>
+     <p class="help">If set, the tool periodically refreshes this view <i>while</i> the write load runs — stresses heavy read+write together.</p>
+     <div><label>Matview (schema.name)</label><select id="matview_sel"></select>
+       <div class="help">Leave blank to skip. Needs a UNIQUE index for a concurrent (non-locking) refresh.</div></div>
    </fieldset>
    <div class="chk"><label style="margin:0"><input type="checkbox" id="confirm" style="width:auto">
      I confirm this URL is a <b>FORK/CLONE</b>, not production.</label></div>
    <button class="ghost" onclick="preview()">Preview SQL</button>
    <button class="ghost" onclick="validate()">✓ Validate mapping</button>
    <button class="warn" onclick="runLoad()">Generate &amp; run load</button>
+   <p class="help"><b>Preview SQL</b>: see the generated statements (writes nothing). &nbsp;
+   <b>✓ Validate mapping</b>: run each statement in a rolled-back transaction to confirm it matches your schema (writes nothing) — <b>always do this first</b>. &nbsp;
+   <b>Generate &amp; run load</b>: run the real measured load (requires the FORK/CLONE box above).</p>
  </div>
 
  <div class="card full">
