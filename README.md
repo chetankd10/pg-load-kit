@@ -13,6 +13,68 @@ call ratios, not by guessing.
 
 ---
 
+## How it works, in plain English
+
+Before you move a database to a new plan, region, or bigger server, you want to know:
+*"will it hold up under our real write traffic?"* You can't hammer production, and a
+fork copies the **data** but not the **traffic** — a fork sits idle. This kit
+**generates realistic write traffic** against a safe copy so you can watch how it
+behaves under load before you commit to the change.
+
+### Why it works on *any* database
+
+The tool **doesn't know anything about your tables in advance.** When you connect it to
+a database, the first thing it does is *look inside* — it reads the tables, columns,
+data types, primary keys, foreign-key relationships, and enum (fixed-choice) fields.
+Then it **writes its test scripts from what it just discovered.** Because every test is
+built fresh from whatever database you point it at, nothing is hardcoded. Point it at an
+orders DB, a customer DB, a Titanic passenger dataset — it inspects each and adapts.
+Change the connection string, click **Discover**, and it re-learns the new schema.
+
+In particular, the "producer" INSERT is synthesized from live metadata: it skips
+auto-generated/defaulted columns, resolves foreign-key columns to a random *existing*
+referenced row (so constraints hold), picks a valid label for enum columns, and
+generates a type-appropriate value for every other required column. No hand-editing per
+table.
+
+### The three write patterns it reproduces
+
+1. **Queue churn** — workers claiming "to-do" rows and marking them done (`SKIP LOCKED`).
+2. **Update volume** — a steady stream of UPDATEs to a large table (a sync process).
+3. **Report refresh** — periodically rebuilding a materialized view under that load.
+
+You control the **mix** (the weights), so it matches *your* real traffic.
+
+### Step by step (browser control panel)
+
+1. **Connect** — paste any `DATABASE_URL`. Read-only inspection is safe against prod; for
+   an actual load test point it at a **fork / dev / UAT** copy, never production.
+2. **🔍 Discover** — the tool inspects the DB and pre-fills a suggested mapping (queue
+   table, big update-target table, key columns). These are *guesses* — you confirm them.
+3. **Confirm the mapping** — via dropdowns, pick which table is the queue and its status
+   values (e.g. `pending` → `shipped`), the big update-target table, and optionally a
+   matview. You choose from the columns it actually found — nothing typed by hand.
+4. **✓ Validate mapping** — runs each statement inside a transaction that is *immediately
+   rolled back* (nothing is written), purely to confirm the SQL matches your schema.
+   Green ✅ per script, or a clear ❌ with the exact reason. Fix any red before running.
+5. **Set the load** — clients, duration, warmup, and the traffic mix; tick the
+   **FORK/CLONE** confirmation.
+6. **Generate & run load** — warms up, then runs the measured test.
+7. **Read the results** — throughput (tps), latency, transactions, auto-interpreted
+   notes (e.g. a network-bound warning), plus DB-side health (writes, cache hit, top
+   queries, locks, size). **📊 Refresh metrics** gives a read-only snapshot anytime.
+
+### Two honest caveats
+
+- **Run it close to the database.** pgbench measures from wherever it runs, so a laptop →
+  distant-cloud test is dominated by network travel, not the DB — numbers look
+  artificially slow. For a real capacity number, run it in the DB's **region** (Heroku
+  one-off dyno / same-region EC2). The UI flags this automatically.
+- **It simulates, it doesn't replay.** It reproduces the *shape* of your write traffic in
+  your chosen mix; it does not replay exact historical queries (see below for why).
+
+---
+
 ## Why this exists — "replay" vs. "simulate"
 
 A common customer ask:
