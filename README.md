@@ -27,8 +27,7 @@ The tool **doesn't know anything about your tables in advance.** When you connec
 a database, the first thing it does is *look inside* — it reads the tables, columns,
 data types, primary keys, foreign-key relationships, and enum (fixed-choice) fields.
 Then it **writes its test scripts from what it just discovered.** Because every test is
-built fresh from whatever database you point it at, nothing is hardcoded. Point it at an
-orders DB, a customer DB, a Titanic passenger dataset — it inspects each and adapts.
+built fresh from whatever database you point it at, nothing is hardcoded. 
 Change the connection string, click **Discover**, and it re-learns the new schema.
 
 In particular, the "producer" INSERT is synthesized from live metadata: it skips
