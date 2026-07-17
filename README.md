@@ -420,7 +420,11 @@ Discover→mapping, so the kit never gets coupled to one schema.
 
 <img width="1725" height="826" alt="Screenshot 2026-07-17 at 6 56 41 PM" src="https://github.com/user-attachments/assets/da8f0132-da49-497d-8591-ee14f924e304" />
 <img width="1115" height="836" alt="Screenshot 2026-07-17 at 6 56 49 PM" src="https://github.com/user-attachments/assets/7c001f65-c454-413f-8570-fa4af63343a6" />
+<img width="1092" height="451" alt="Screenshot 2026-07-17 at 6 58 50 PM" src="https://github.com/user-attachments/assets/bd83b33f-dfc2-4276-918e-6bee503d18ce" />
+<img width="1109" height="725" alt="Screenshot 2026-07-17 at 6 59 40 PM" src="https://github.com/user-attachments/assets/63129228-2c97-4d1e-96f0-1ca4a622a47d" />
+<img width="1090" height="680" alt="Screenshot 2026-07-17 at 6 59 47 PM" src="https://github.com/user-attachments/assets/c3e502e3-0eb5-4018-934e-2cf9460b35ba" />
 
+---
 
 ## Troubleshooting
 
