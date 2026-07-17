@@ -13,7 +13,7 @@ call ratios, not by guessing.
 
 ---
 
-## How it works, in plain English
+## How it works
 
 Before you move a database to a new plan, region, or bigger server, you want to know:
 *"will it hold up under our real write traffic?"* You can't hammer production, and a
