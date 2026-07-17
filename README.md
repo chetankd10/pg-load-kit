@@ -162,6 +162,70 @@ Open **http://127.0.0.1:8765** and follow the 7 steps below.
 metrics**) are safe against production. Write actions (**Run load**) require the
 FORK/CLONE confirmation.
 
+### Field reference — every control on the screen
+
+Each field also has this same guidance inline in the UI. Examples use `public.orders`.
+
+**Connection**
+
+| Field / button | What it is | What to enter | Gotcha |
+|---|---|---|---|
+| DATABASE_URL | Connection string to the DB you're testing | `postgres://user:pass@host:5432/db?sslmode=require` | Append `?sslmode=require` on Heroku or it errors on SSL |
+| 🔍 Discover schema | Reads this DB's tables/columns/keys, pre-fills the mapping | click it after pasting the URL | Read-only; safe on prod |
+
+**Job-queue table** (the SKIP LOCKED "claim a to-do row" pattern)
+
+| Field | What it is | What to enter (orders) | Gotcha |
+|---|---|---|---|
+| Table | Table workers claim rows from | `public.orders` | Must have a real status/state column — a passenger/product dataset is **not** a queue |
+| ID / order column | PK used to order & lock rows | `id` | — |
+| **Status column** | Column holding the workflow state | `status` | **Must be text/enum, never an integer** — this is the #1 error source |
+| Locked-at column | Timestamp stamped when a row is claimed | `modified` | Any spare timestamp column |
+| Payload column | Text column the producer INSERT writes | `stripe_charge_id` | Any text column; not critical |
+| Created-at column | Timestamp set on insert | `created` | — |
+| **"queued" value** | The "waiting" value to claim | `pending` | Must be a **real value already in that column**; no trailing spaces (auto-trimmed now) |
+| **"running" value** | The "claimed/in-progress" value | `shipped` | Must be real **and different** from the queued value |
+
+**Big UPDATE-target table** (the high-volume sync-UPDATE pattern)
+
+| Field | What it is | What to enter (orders) | Gotcha |
+|---|---|---|---|
+| Table | Large table to hammer with UPDATEs | `public.orders` | Pick your biggest / most-written table |
+| PK column | Primary key each UPDATE targets | `id` | — |
+| Payload column | Optional column to "touch" | `(none)` | `(none)` is fine if unsure |
+| Updated-at column | Optional timestamp set to `now()` | `modified` | `(none)` is fine |
+| Max PK | The table's `max(pk)` | `100000` | Set to the real row count so random IDs hit existing rows |
+| Zipfian skew s | How concentrated the writes are | `1.1` | `1.1`=mild hotspot; higher=hotter few rows |
+
+**Materialized view** (optional)
+
+| Field | What it is | What to enter | Gotcha |
+|---|---|---|---|
+| Matview (schema.name) | View refreshed *during* the load | leave blank, or `public.orders_daily_sales` | Needs a UNIQUE index for a concurrent (non-locking) refresh |
+
+**Run settings**
+
+| Field | What it is | Typical value | Gotcha |
+|---|---|---|---|
+| Clients | Simultaneous connections | `20` | More = more contention |
+| Threads | pgbench worker threads | `4` | ~ clients ÷ 5 |
+| Duration (s) | Measured run length | `30` (quick) / `300+` (real) | Use 300+ so autovacuum/bloat show up |
+| Warmup (s) | Discarded warm-up before measuring | `10` | Avoids cold-cache skew |
+| W consumer / producer / update | Traffic mix (relative weights) | `6 / 0 / 5` | See weights below; `0` disables a pattern |
+
+**Buttons**
+
+| Button | Does | Writes data? |
+|---|---|---|
+| Preview SQL | Shows the generated statements | No |
+| ✓ Validate mapping | Runs each statement in a rolled-back transaction to confirm it fits your schema | No — **always run this first** |
+| Generate & run load | Runs the real measured load | **Yes** — requires the FORK/CLONE checkbox |
+| 📊 Refresh metrics | Pulls DB health read-only | No |
+
+**The two rules that prevent almost every error:**
+1. The **status column must be text/enum**, not an integer.
+2. The **queued/running values must be two real, distinct values already present** in that column.
+
 ### Weights (W consumer / W producer / W update)
 
 These are the **relative ratios** pgbench uses to pick which script runs next:
