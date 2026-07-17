@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# Runtime-generated pgbench scripts (built per-run from your schema mapping)
+scripts/generated/
+
+# Local logs / scratch
+*.log
