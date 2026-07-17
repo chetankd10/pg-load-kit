@@ -236,6 +236,74 @@ These are the **relative ratios** pgbench uses to pick which script runs next:
 
 ---
 
+## Reading the results
+
+After a run, the **Results** section shows six stat cards, auto-interpreted notes, a
+per-script breakdown, and DB-side health tables. Here's what each number means.
+
+### The six stat cards
+
+| Card | Means | Good direction | Notes |
+|---|---|---|---|
+| **tps** | Transactions completed per second | **higher** | The headline throughput number |
+| **latency** | Average time per transaction | **lower** | Includes network round-trip (see below) |
+| **stddev** | Latency jitter (variability) | **lower** | High stddev = uneven response, contention or GC pauses |
+| **txns** | Total transactions processed in the window | — | `0` means every statement errored — run **✓ Validate mapping** |
+| **clients** | Concurrent connections used | — | Echoes your Run setting |
+| **connect** | Initial connection time | **lower** | Seconds here = high RTT = you're far from the DB |
+
+### Worked example — spotting a network-bound run
+
+A real run from a laptop against a cloud DB:
+
+```
+tps      = 77          transactions/sec
+latency  = 261.0 ms    avg per txn
+stddev   = 51.8 ms     latency jitter
+txns     = 8,024       processed
+clients  = 20          concurrent
+connect  = 15.4 s      initial connection time
+```
+
+This looks slow — but it is **not** a database limit, it's a **client-location artifact**:
+
+- **261 ms per transaction** is enormous for simple single-row writes. A DB executes
+  these in well under a millisecond; the other ~260 ms is **network round-trip** between
+  the client and the DB.
+- **15.4 s initial connection time** for 20 clients confirms a high-latency link (TLS
+  handshakes over a long RTT). Same-region, this is milliseconds.
+- **tps ≈ 77** is just `~1 / latency × clients` — throughput is capped by round-trip
+  time, not by the database. The DB is mostly idle, waiting on the wire.
+
+The UI flags exactly this automatically:
+
+> ⚠️ High per-transaction latency (261 ms) with low tps (77) suggests a **NETWORK-bound
+> run** (client far from DB). For a true capacity number, run this generator in the DB's
+> region (Heroku one-off dyno / same-region EC2).
+
+**To get a real number:** run the kit in the DB's region and compare. Cross-check by
+looking at **`mean_ms`** in the "Top write queries" panel — that's the *server-side*
+execution time. If `mean_ms` is a fraction of a millisecond while the card latency is
+hundreds of ms, the gap is pure network and your DB has plenty of headroom.
+
+### The other result panels
+
+- **Per-script breakdown** — tps and transaction count for each of consumer / producer /
+  update, so you see which pattern dominated.
+- **Write activity** — inserts/updates/deletes and **dead rows** per table. Rising dead
+  rows show the UPDATE/queue churn producing bloat; watch whether autovacuum keeps up.
+- **Cache hit ratio** — want **>99%**. A lower ratio means the working set doesn't fit in
+  memory and reads are hitting disk.
+- **Top write queries** (`pg_stat_statements`) — the heaviest statements by total time,
+  with `mean_ms` (server-side per-call time — the true DB cost).
+- **Locks currently held** / **DB size & connections** — contention and growth snapshot.
+
+**Bottom line:** compare tps between two plans/regions under the *same* load for a fair
+capacity read — but only when running **in-region**, or the network dominates and you're
+measuring your link, not the database.
+
+---
+
 ## Command-line usage (no UI)
 
 Edit the three template scripts in `scripts/` to your schema, then run the driver:
