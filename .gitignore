@@ -6,3 +6,7 @@ scripts/generated/
 
 # Local logs / scratch
 *.log
+
+# Python bytecode cache
+__pycache__/
+*.pyc

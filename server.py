@@ -61,8 +61,11 @@ CHECKS = {
 INTROSPECT_SQL = r"""
 WITH cols AS (
   SELECT c.table_schema, c.table_name,
-         json_agg(json_build_object('name', c.column_name, 'type', c.data_type)
-                  ORDER BY c.ordinal_position) AS columns
+         json_agg(json_build_object(
+             'name', c.column_name, 'type', c.data_type, 'udt', c.udt_name,
+             'nullable', (c.is_nullable = 'YES'),
+             'has_default', (c.column_default IS NOT NULL))
+           ORDER BY c.ordinal_position) AS columns
   FROM information_schema.columns c
   WHERE c.table_schema NOT IN ('pg_catalog','information_schema')
   GROUP BY c.table_schema, c.table_name
@@ -76,6 +79,33 @@ pk AS (
    AND kcu.table_schema   = tc.table_schema
   WHERE tc.constraint_type = 'PRIMARY KEY'
   GROUP BY tc.table_schema, tc.table_name
+),
+fk AS (
+  -- foreign keys, one row per (table, fk column) so the producer can resolve a
+  -- valid referenced id at INSERT time. Multi-column FKs are matched by position.
+  SELECT ns.nspname AS table_schema, cl.relname AS table_name,
+         json_agg(json_build_object(
+             'column', att.attname,
+             'ref_schema', fns.nspname, 'ref_table', fcl.relname,
+             'ref_column', fatt.attname)) AS fks
+  FROM pg_constraint con
+  JOIN pg_class cl      ON cl.oid = con.conrelid
+  JOIN pg_namespace ns  ON ns.oid = cl.relnamespace
+  JOIN pg_class fcl     ON fcl.oid = con.confrelid
+  JOIN pg_namespace fns ON fns.oid = fcl.relnamespace
+  JOIN LATERAL unnest(con.conkey)  WITH ORDINALITY AS ck(attnum, ord)  ON true
+  JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fk2(attnum, ord) ON fk2.ord = ck.ord
+  JOIN pg_attribute att  ON att.attrelid = con.conrelid  AND att.attnum = ck.attnum
+  JOIN pg_attribute fatt ON fatt.attrelid = con.confrelid AND fatt.attnum = fk2.attnum
+  WHERE con.contype = 'f'
+  GROUP BY ns.nspname, cl.relname
+),
+enums AS (
+  SELECT json_object_agg(typname, labels) AS e FROM (
+    SELECT t.typname, json_agg(e.enumlabel ORDER BY e.enumsortorder) AS labels
+    FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid
+    GROUP BY t.typname
+  ) z
 ),
 tabs AS (
   SELECT n.nspname AS schema, c.relname AS name,
@@ -95,13 +125,16 @@ SELECT json_build_object(
        'schema', t.schema, 'name', t.name, 'bytes', t.bytes,
        'live_rows', t.live_rows,
        'columns', COALESCE(cols.columns, '[]'::json),
-       'pk', COALESCE(pk.pk_cols, '[]'::json))
+       'pk', COALESCE(pk.pk_cols, '[]'::json),
+       'fks', COALESCE(fk.fks, '[]'::json))
      ORDER BY t.bytes DESC)
      FROM tabs t
      LEFT JOIN cols ON cols.table_schema=t.schema AND cols.table_name=t.name
-     LEFT JOIN pk   ON pk.table_schema=t.schema   AND pk.table_name=t.name), '[]'::json),
+     LEFT JOIN pk   ON pk.table_schema=t.schema   AND pk.table_name=t.name
+     LEFT JOIN fk   ON fk.table_schema=t.schema   AND fk.table_name=t.name), '[]'::json),
   'matviews', COALESCE((SELECT json_agg(json_build_object('schema',schema,'name',name))
-                        FROM mviews), '[]'::json)
+                        FROM mviews), '[]'::json),
+  'enums', COALESCE((SELECT e FROM enums), '{}'::json)
 ) AS payload;
 """
 
@@ -153,6 +186,20 @@ def run(cmd, env=None, timeout=None):
         return 127, "", f"command not found: {e}"
 
 
+def introspect(url):
+    """Run INTROSPECT_SQL against the given DB and return the parsed schema dict
+    ({tables, matviews, enums}), or None on failure. Shared by /introspect,
+    /validate and /run so generated SQL always reflects the CURRENTLY connected
+    database — the kit is never tied to one schema."""
+    rc, out, err = run(["psql", url, "-At", "-c", INTROSPECT_SQL], timeout=60)
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        return json.loads(out.strip())
+    except Exception:
+        return None
+
+
 def collect_metrics(url):
     """Run every METRICS query read-only and return {name: psql_table_text}.
     Best-effort: a failing query (e.g. pg_stat_statements not enabled) is reported
@@ -178,8 +225,9 @@ def preflight(url, script_text, weight):
             continue
         stmt.append(line)
     sql = "\n".join(stmt)
-    # Replace pgbench :vars with harmless literals so the parser/planner is exercised.
-    sql = re.sub(r":\w+", "1", sql)
+    # Replace pgbench :vars with harmless literals so the parser/planner is
+    # exercised. Negative lookbehind so we don't corrupt "::type" casts.
+    sql = re.sub(r"(?<!:):\w+", "1", sql)
     wrapped = "BEGIN;\n" + sql.rstrip().rstrip(";") + ";\nROLLBACK;"
     rc, out, err = run(["psql", url, "-v", "ON_ERROR_STOP=1", "-q", "-c", wrapped], timeout=20)
     if rc == 0:
@@ -194,10 +242,106 @@ def qi(name):
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def gen_scripts(m):
+def synth_value(col, enums):
+    """Generate a pgbench-safe SQL literal/expression for one column when
+    building a generic INSERT. Type-driven so it works on ANY table:
+      - enum         -> a real label from the enum
+      - int/serial   -> random_zipfian-free random int
+      - numeric/float-> random numeric
+      - bool         -> random true/false
+      - timestamp/date -> now()
+      - uuid         -> gen_random_uuid()
+      - json/jsonb   -> '{}'
+      - text/varchar/char/bytea/other -> short random string
+    FK columns are handled separately (subselect) before this is called.
+    Returns a SQL expression string (already safe: no user text interpolated)."""
+    udt = (col.get("udt") or "").lower()
+    typ = (col.get("type") or "").lower()
+    # enum: udt is the enum type name; pick its first label (a known-valid value)
+    labels = enums.get(udt)
+    if labels:
+        return "'" + str(labels[0]).replace("'", "''") + "'"
+    if typ in ("boolean",) or udt == "bool":
+        return "(random() < 0.5)"
+    if any(k in typ for k in ("timestamp", "date", "time")):
+        return "now()"
+    if "uuid" in typ or udt == "uuid":
+        return "gen_random_uuid()"
+    if "json" in typ:
+        return "'{}'"
+    if any(k in typ for k in ("integer", "bigint", "smallint", "serial")) \
+       or udt in ("int2", "int4", "int8"):
+        return "(floor(random()*1000000))::bigint"
+    if any(k in typ for k in ("numeric", "decimal", "real", "double", "money")):
+        return "round((random()*1000)::numeric, 2)"
+    if "bytea" in typ:
+        return "'\\x00'::bytea"
+    # text / varchar / char / anything else: short random string
+    return "substr(md5(random()::text), 1, 12)"
+
+
+def gen_producer(m, schema):
+    """Build a GENERIC INSERT for the job-queue table from live schema metadata,
+    so the producer works on ANY table (not just a simple queue shape):
+      - skip serial PK columns and columns that have a DEFAULT (let Postgres fill)
+      - resolve FK columns to a random existing referenced id (keeps FKs valid)
+      - synthesize every other NOT-NULL column by type
+      - nullable, defaultless, non-FK columns are omitted (default NULL)
+    Returns the INSERT SQL, or a harmless no-op if the table can't be introspected."""
+    jt = qual(m["jobs_schema"], m["jobs_table"])
+    tinfo = None
+    for t in schema.get("tables", []):
+        if t.get("schema") == m["jobs_schema"] and t.get("name") == m["jobs_table"]:
+            tinfo = t
+            break
+    if not tinfo:
+        return f"-- GENERATED: could not introspect {jt}; producer disabled.\nSELECT 1;\n"
+
+    enums = schema.get("enums", {}) or {}
+    pk = set(tinfo.get("pk") or [])
+    # map fk column -> (ref_schema, ref_table, ref_column)
+    fkmap = {}
+    for fk in tinfo.get("fks", []):
+        fkmap[fk["column"]] = (fk["ref_schema"], fk["ref_table"], fk["ref_column"])
+
+    status_col = m.get("jobs_status")
+    qval = (m.get("queued_value") or "").replace("'", "''")
+
+    cols, vals = [], []
+    for c in tinfo.get("columns", []):
+        name = c["name"]
+        # let the DB fill serial/identity PKs and any column with a default
+        if c.get("has_default"):
+            continue
+        if name in pk and (c.get("has_default") or "serial" in (c.get("type") or "").lower()):
+            continue
+        # FK column: pick a random existing referenced row so the constraint holds
+        if name in fkmap:
+            rs, rt, rc = fkmap[name]
+            cols.append(qi(name))
+            vals.append(f"(SELECT {qi(rc)} FROM {qual(rs, rt)} ORDER BY random() LIMIT 1)")
+            continue
+        # status column: insert the "queued" value so the consumer has work to claim
+        if status_col and name == status_col and qval:
+            cols.append(qi(name)); vals.append(f"'{qval}'"); continue
+        # NOT-NULL, no default, not FK: must synthesize a value
+        if not c.get("nullable"):
+            cols.append(qi(name)); vals.append(synth_value(c, enums))
+        # nullable + no default + not FK: skip (defaults to NULL)
+    if not cols:
+        return f"-- GENERATED: {jt} has no insertable columns; producer disabled.\nSELECT 1;\n"
+    collist = ", ".join(cols)
+    vallist = ", ".join(vals)
+    return (f"-- GENERATED by pg-load-kit. Generic producer (INSERT synthesized by column type/FK).\n"
+            f"INSERT INTO {jt} ({collist})\nVALUES ({vallist});\n")
+
+
+def gen_scripts(m, schema=None):
     """Write pgbench scripts from a mapping dict of real table/column names.
-    Returns (consumer_path, producer_path, update_path) — all inside GEN.
-    Identifiers are validated against an allow-list before use."""
+    Returns (paths, previews). If `schema` (the introspection payload) is given,
+    the producer INSERT is synthesized generically from column metadata + FKs so
+    it works on ANY table; otherwise it falls back to the simple queue-shape INSERT.
+    Identifiers are quoted; no raw user text is interpolated unescaped."""
     os.makedirs(GEN, exist_ok=True)
     jt   = qual(m["jobs_schema"], m["jobs_table"])
     id_  = qi(m["jobs_id"])
@@ -245,7 +389,12 @@ UPDATE {jt}
  )
 RETURNING {id_};
 """
-    producer = f"""-- GENERATED by pg-load-kit control panel. Job-queue producer (INSERT).
+    if schema is not None:
+        # Generic INSERT synthesized from live column metadata + FKs — works on any table.
+        producer = gen_producer(m, schema)
+    else:
+        # Fallback: simple queue-shape INSERT (payload, status, created).
+        producer = f"""-- GENERATED by pg-load-kit control panel. Job-queue producer (INSERT).
 INSERT INTO {jt} ({pl}, {st}, {cr})
 VALUES (repeat('x', 200), '{qval}', now());
 """
@@ -313,6 +462,8 @@ class Handler(BaseHTTPRequestHandler):
             schema["suggestion"] = suggest_mapping(schema)
             return self._send(200, json.dumps(schema))
 
+        # (introspect() helper is reused by /validate and /run below.)
+
         if self.path == "/metrics":
             # On-demand read-only metrics pull (no load run needed).
             return self._send(200, json.dumps({"metrics": collect_metrics(url)}))
@@ -324,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
             if not mapping:
                 return self._send(200, json.dumps({"error": "no mapping to validate"}))
             try:
-                _, preview = gen_scripts(mapping)
+                _, preview = gen_scripts(mapping, introspect(url))
             except (KeyError, ValueError) as e:
                 return self._send(200, json.dumps({"error": f"bad schema mapping: {e}"}))
             checks = {
@@ -344,7 +495,7 @@ class Handler(BaseHTTPRequestHandler):
             preview = None
             if mapping:
                 try:
-                    paths, preview = gen_scripts(mapping)
+                    paths, preview = gen_scripts(mapping, introspect(url))
                 except (KeyError, ValueError) as e:
                     return self._send(200, json.dumps({"rc": 1, "out": "",
                         "err": f"bad schema mapping: {e}"}))
