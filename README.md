@@ -416,6 +416,12 @@ Discover→mapping, so the kit never gets coupled to one schema.
 
 ---
 
+## Simulation Screenshots
+
+<img width="1725" height="826" alt="Screenshot 2026-07-17 at 6 56 41 PM" src="https://github.com/user-attachments/assets/da8f0132-da49-497d-8591-ee14f924e304" />
+<img width="1115" height="836" alt="Screenshot 2026-07-17 at 6 56 49 PM" src="https://github.com/user-attachments/assets/7c001f65-c454-413f-8570-fa4af63343a6" />
+
+
 ## Troubleshooting
 
 | Symptom | Cause & fix |
@@ -426,3 +432,5 @@ Discover→mapping, so the kit never gets coupled to one schema.
 | `column "id" is of type integer but expression is of type text` | The producer INSERT can't be synthesized for this table (typed/FK columns). Set **W producer = 0**. |
 | SSL / connection errors on Heroku | Append `?sslmode=require` to the URL. |
 | Very low tps (tens), high latency (hundreds of ms) | Network-bound — you're running far from the DB. Run in-region (see above). |
+
+
