@@ -13,6 +13,22 @@ call ratios, not by guessing.
 
 ---
 
+## What it does, in plain English
+
+Before you move a database to a bigger plan, a new region, or a new server, you want
+to know whether it'll hold up under your *real* write traffic — but you can't test
+against production, and a fork/clone only copies the **data**, not the **traffic** (a
+fork just sits there, idle). This kit **generates realistic write traffic** against a
+safe copy so you can watch it behave under load before committing to the change.
+
+It's smart about not being hardcoded to one schema: point it at a database and it
+looks inside (tables, columns, types, keys, enums) and **writes its own test scripts
+from what it finds** — you just confirm the mapping via dropdowns. It then runs the
+load through `pgbench` and reports throughput, latency, and DB-health stats, with a
+built-in warning if a result looks network-bound rather than DB-bound.
+
+---
+
 ## How it works
 
 Before you move a database to a new plan, region, or bigger server, you want to know:
@@ -104,16 +120,32 @@ run it against a fork or a disposable UAT/DEV DB. **That is this kit.**
 
 ## Requirements
 
+### Client-side tools (on the machine running the kit)
+
 - **`psql` and `pgbench`** — the Postgres client tools (`pgbench` ships with them).
   - macOS: `brew install libpq && brew link --force libpq`
 - **`python3`** — stdlib only, no packages to install (for the browser control panel).
-- **`pg_stat_statements`** enabled on production (default on Heroku Postgres) — used to
-  derive the real traffic mix.
 
 Check you have the tools:
 ```bash
 psql --version && pgbench --version
 ```
+
+### Database prerequisites
+
+- **`pg_stat_statements` enabled on production** (default on Heroku Postgres) — used to
+  derive the real traffic-mix ratios; without it you'd be guessing the weights instead
+  of setting them from real call counts.
+- **A fork, clone, or disposable UAT/DEV copy** of that database to actually run the
+  load against — **never production.** (Discover / Validate / Refresh-metrics are
+  read-only and safe against prod; only the measured load run needs the copy.)
+- **Schema shape** for whichever tables you map in:
+  - **Job-queue table:** a real **text/enum status column** (not an integer), with at
+    least two distinct existing values (e.g. `pending` / `shipped`).
+  - **Big update-target table:** a primary key, plus its real `max(pk)` so generated
+    writes land on existing rows.
+  - **Materialized view (optional):** a **UNIQUE index**, needed for a concurrent
+    (non-locking) refresh.
 
 ---
 
